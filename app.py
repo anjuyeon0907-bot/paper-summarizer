@@ -1,11 +1,20 @@
 import io
 import os
+import re
+from xml.sax.saxutils import escape
 
 import arxiv
 import streamlit as st
+from docx import Document
 from dotenv import load_dotenv
 from openai import OpenAI
 from pypdf import PdfReader
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 load_dotenv()
 
@@ -61,6 +70,119 @@ MAX_INPUT_CHARS = 15000
 
 # Gemini exposes an OpenAI-compatible endpoint, so the openai client works as-is.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# Built-in CJK CID font: renders Korean in the PDF without bundling a font file.
+pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+_PDF_BODY_STYLE = ParagraphStyle(name="Body", fontName="HYGothic-Medium", fontSize=10, leading=15)
+_PDF_HEADING_STYLES = {
+    level: ParagraphStyle(
+        name=f"H{level}",
+        fontName="HYGothic-Medium",
+        fontSize=16 - level * 2,
+        leading=20 - level * 2,
+        spaceBefore=10,
+        spaceAfter=6,
+    )
+    for level in (1, 2, 3, 4)
+}
+
+DOWNLOAD_FORMATS = ["Markdown (.md)", "TXT (.txt)", "Word (.docx)", "PDF (.pdf)"]
+
+
+def slugify_filename(name: str, max_length: int = 60) -> str:
+    name = re.sub(r'[\\/:*?"<>|]', "", name)
+    name = re.sub(r"\s+", "_", name.strip())
+    return name[:max_length] or "paper"
+
+
+def markdown_to_plain_text(markdown_text: str) -> str:
+    lines = []
+    for line in markdown_text.splitlines():
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        line = re.sub(r"^-\s+", "• ", line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def markdown_to_docx_bytes(markdown_text: str) -> bytes:
+    doc = Document()
+    for line in markdown_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            doc.add_paragraph("")
+            continue
+        heading_match = re.match(r"^(#{1,6})\s+(.*)", stripped)
+        if heading_match:
+            level = min(len(heading_match.group(1)), 4)
+            doc.add_heading(heading_match.group(2), level=level)
+        elif stripped.startswith("- "):
+            doc.add_paragraph(re.sub(r"\*\*(.+?)\*\*", r"\1", stripped[2:]), style="List Bullet")
+        else:
+            doc.add_paragraph(re.sub(r"\*\*(.+?)\*\*", r"\1", stripped))
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+
+def _md_inline_to_reportlab(text: str) -> str:
+    text = escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+
+def markdown_to_pdf_bytes(markdown_text: str) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        topMargin=20 * mm,
+        bottomMargin=20 * mm,
+        leftMargin=20 * mm,
+        rightMargin=20 * mm,
+    )
+    story = []
+    for line in markdown_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            story.append(Spacer(1, 6))
+            continue
+        heading_match = re.match(r"^(#{1,6})\s+(.*)", stripped)
+        if heading_match:
+            level = min(len(heading_match.group(1)), 4)
+            story.append(Paragraph(_md_inline_to_reportlab(heading_match.group(2)), _PDF_HEADING_STYLES[level]))
+        elif stripped.startswith("- "):
+            story.append(Paragraph(f"• {_md_inline_to_reportlab(stripped[2:])}", _PDF_BODY_STYLE))
+        else:
+            story.append(Paragraph(_md_inline_to_reportlab(stripped), _PDF_BODY_STYLE))
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def render_download_section(markdown_text: str, base_filename: str, key_prefix: str) -> None:
+    fmt = st.selectbox(
+        "다운로드 형식",
+        DOWNLOAD_FORMATS,
+        key=f"{key_prefix}_format",
+    )
+    if fmt == "Markdown (.md)":
+        data, mime, ext = markdown_text.encode("utf-8"), "text/markdown", "md"
+    elif fmt == "TXT (.txt)":
+        data, mime, ext = markdown_to_plain_text(markdown_text).encode("utf-8"), "text/plain", "txt"
+    elif fmt == "Word (.docx)":
+        data = markdown_to_docx_bytes(markdown_text)
+        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ext = "docx"
+    else:
+        data, mime, ext = markdown_to_pdf_bytes(markdown_text), "application/pdf", "pdf"
+
+    st.download_button(
+        "다운로드",
+        data=data,
+        file_name=f"{base_filename}.{ext}",
+        mime=mime,
+        icon=":material/download:",
+        key=f"{key_prefix}_download",
+    )
 
 
 @st.cache_data(ttl="1h", max_entries=50)
@@ -154,13 +276,10 @@ with tab_search:
             summary = st.session_state.get(f"summary_arxiv_{i}")
             if summary:
                 st.markdown(summary)
-                st.download_button(
-                    "마크다운 다운로드",
-                    data=summary,
-                    file_name=f"{paper['title'][:50]}_summary.md",
-                    mime="text/markdown",
-                    icon=":material/download:",
-                    key=f"download_arxiv_{i}",
+                render_download_section(
+                    summary,
+                    f"{slugify_filename(paper['title'])}_summary",
+                    key_prefix=f"arxiv_{i}",
                 )
 
 with tab_pdf:
@@ -186,15 +305,13 @@ with tab_pdf:
                     st.error(f"요약 중 오류가 발생했습니다: {e}")
 
     pdf_summary = st.session_state.get("summary_pdf")
-    if pdf_summary:
+    if pdf_summary and uploaded_file:
         st.markdown(pdf_summary)
-        st.download_button(
-            "마크다운 다운로드",
-            data=pdf_summary,
-            file_name="pdf_summary.md",
-            mime="text/markdown",
-            icon=":material/download:",
-            key="download_pdf",
+        paper_name = os.path.splitext(uploaded_file.name)[0]
+        render_download_section(
+            pdf_summary,
+            f"{slugify_filename(paper_name)}_summary",
+            key_prefix="pdf_summary",
         )
 
 with tab_protocol:
@@ -221,14 +338,11 @@ with tab_protocol:
                     st.error(f"프로토콜 추출 중 오류가 발생했습니다: {e}")
 
     protocol_result = st.session_state.get("protocol_result")
-    if protocol_result:
+    if protocol_result and protocol_file:
         st.markdown(protocol_result)
-        st.download_button(
-            "마크다운 다운로드",
-            data=protocol_result,
-            file_name="protocol.md",
-            mime="text/markdown",
-            icon=":material/download:",
-            key="download_protocol",
+        paper_name = os.path.splitext(protocol_file.name)[0]
+        render_download_section(
+            protocol_result,
+            f"{slugify_filename(paper_name)}_protocol",
+            key_prefix="protocol",
         )
-
