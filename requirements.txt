@@ -1,0 +1,11 @@
+streamlit==1.64.0
+pydantic==2.13.5
+pypdf==6.19.0
+requests==2.34.2
+python-dotenv==1.2.3
+anthropic==1.6.0
+openai==3.14.1
+google-genai==2.24.0
+pandas==3.0.5
+openpyxl==3.1.5
+plotly==6.3.1
