@@ -3,3 +3,5 @@ arxiv
 pypdf
 openai
 python-dotenv
+python-docx
+reportlab
